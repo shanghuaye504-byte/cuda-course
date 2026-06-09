@@ -185,3 +185,65 @@ void CUDART_CB MyCallback(cudaStream_t stream, cudaError_t status, void *userDat
 kernel<<<grid, block, 0, stream>>>(args);
 cudaStreamAddCallback(stream, MyCallback, nullptr, 0);
 ```
+
+
+这段代码之所以比前一段“高级”，是因为它不再局限于单纯的“数据搬运与计算并发”，而是引入了 CUDA 异步架构中最精妙的三大核心机制：
+流优先级控制（Stream Priorities）：抢占 GPU 计算资源。
+跨流事件同步（Cross-Stream Event Synchronization）：实现精准、非阻塞的流水线交接。
+主机回调机制（Stream Callbacks）：让 GPU 能够主动“拍一拍”CPU 汇报进度。
+更赞的是，你这次默默把 CPU 内存分配改成了 cudaMallocHost（页锁定内存），完美避开了上一个程序的性能痛点！
+下面我们用大白话和深度透视，拆解这段代码到底高级在哪里。
+🚀 核心跨越：三大“高级”机制硬核拆解
+### 1. 降维打击一：流优先级与非阻塞模式 (cudaStreamCreateWithPriority)
+在上一段代码中，创建流只是机械地平分秋色。而在这里：
+```
+C++
+int leastPriority, greatestPriority;
+// 1. 先向 GPU 打听它支持的优先级范围（比如 0 代表最低，-1 代表最高）
+CHECK_CUDA_ERROR(cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
+
+// 2. 创建 stream1，给它分配最低优先级
+CHECK_CUDA_ERROR(cudaStreamCreateWithPriority(&stream1, cudaStreamNonBlocking, leastPriority));
+// 3. 创建 stream2，给它分配最高优先级
+CHECK_CUDA_ERROR(cudaStreamCreateWithPriority(&stream2, cudaStreamNonBlocking, greatestPriority));
+```
+高级点一：cudaStreamNonBlocking：默认创建的流如果遇到老旧的“默认流（Null Stream）”，会被强制阻塞死等。加上这个参数后，stream1 和 stream2 变成了真正的自由之身，绝对不会被默认流拖垮。
+高级点二：优先级抢占：当 GPU 的硬件计算单元（SM）非常繁忙时，GPU 内部的硬件调度器会优先把计算资源喂给 stream2（最高优先级）。这在生产环境中用于确保“紧急任务（如实时推理、大模型 Token 生成）”不被“背景任务（如数据预处理、模型打 checkpoint）”卡死。
+### 2. 降维打击二：跨流事件同步 (cudaStreamWaitEvent) —— 优雅的接力棒
+这是整段代码最精彩的灵性所在。
+我们知道，kernel2 必须等 kernel1 算完才能执行（因为 kernel2 要在它的基础上加 1）。如果不用高级特性，通常做法是让 CPU 调用 cudaStreamSynchronize(stream1) 卡死等待，但这会让 CPU 闲置。
+这段代码使用了 cudaEvent_t（事件） 来做跨流的“无声交接”：
+```C++
+// 1. 让 stream1 在执行完搬运和 kernel1 之后，在流水线上立一个“路碑”（Record）
+CHECK_CUDA_ERROR(cudaEventRecord(event, stream1));
+
+// 2. 核心魔法：让 stream2 睁眼看着这个“路碑”
+CHECK_CUDA_ERROR(cudaStreamWaitEvent(stream2, event, 0));
+```
+大厂思维解析：
+注意！cudaStreamWaitEvent 是一个完全异步的指令。CPU 执行到这一行时，根本不会停下，而是瞬间闪过。
+它的真正作用是给 GPU 硬件下达了一条底层指令：“stream2 队列里的 kernel2 先憋着别动，直到你看到 stream1 已经顺利撞线通过了刚才那个 event 路碑，stream2 再自动松开刹车开跑。”
+整个过程完全在 GPU 硬件层面内部消化，CPU 一直在纵观全局做其他事，实现了真正的非阻塞（Non-blocking）流水线！
+### 3. 降维打击三：GPU 主动通知 CPU 的回调函数 (cudaStreamAddCallback)
+在传统的 CUDA 编程中，CPU 要想知道 GPU 算完了没有，只能苦苦地调用 Synchronize 去轮询。而这段代码展示了现代异步框架的玩法：
+```C++
+// 登记一个回调：等 stream2 跑到这一步时，请 GPU 主动触发 CPU 上的 myStreamCallback 函数
+CHECK_CUDA_ERROR(cudaStreamAddCallback(stream2, myStreamCallback, NULL, 0));
+```
+应用场景：在大模型的多卡训练（如 Megatron-LM、DeepSpeed）或者异步日志记录中，当这一批数据在 GPU 算完的瞬间，通过 Callback 立刻通知 CPU 启动下一步的动态内存回收、或者向远程服务器发送心跳包。这就把单向的控制变成了双向的互动。
+📊 完美的工作流时间线（Timeline）
+让我们把这段高级代码在 GPU 内部的真实执行轨迹画出来：
+stream1 启动 → 异步把数据从 CPU 捞到 GPU → 启动 kernel1（乘2操作）。
+stream1 撞线 → 激活 event 信号。
+stream2 收到信号 → 解除硬件等待 → 启动 kernel2（加1操作）。
+stream2 推进到中点 → 触发 myStreamCallback，此时你在终端看到了打印：Stream callback: Operation completed。
+stream2 收尾 → 异步把最终完美的数据推回 CPU。
+CPU 端 → 调用 cudaStreamSynchronize 做最后总清点，验证通过，通关爆出 Test PASSED！
+💡 课后彩蛋：你代码里一行有趣的“迷之行为”
+你在看这段代码时，有没有注意到第 32 行这句看起来很奇怪的代码：
+```C++
+cudaEvent_t event;
+std::cout << event << std::endl;  // <--- 这一行
+```
+如果你尝试编译运行它，编译器可能会在这里给你弹出一个警告，或者打印出一个奇奇怪怪的十六进制地址（比如 0x0）。
+因为此时 event 只是在栈上声明了一个指针变量，还没有被真正初始化（真正的初始化在第 44 行 cudaEventCreate(&event)）。在它被 Create 之前去打印它，属于 C++ 中的“未定义行为”，在严谨的工业级代码中，这一行一般会在 Debug 完后被随手删掉。
